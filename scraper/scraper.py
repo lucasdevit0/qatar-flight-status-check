@@ -1,0 +1,444 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from html import escape
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from openai import OpenAI
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger(__name__)
+
+
+ALERTS_URL = "https://www.qatarairways.com/en/travel-alerts.html"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120"
+STORE_PATH = Path(__file__).with_name("alerts.json")
+DEBUG_SNAPSHOT_PATH = Path(__file__).with_name("debug_snapshot.html")
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+
+WAIT_SELECTORS = [
+    ".accordionItem",
+    '[class*="accordionItem"]',
+    '[class*="accordion-item"]',
+    ".travel-alert__item",
+    "article",
+]
+
+EXTRACTION_STRATEGIES = [
+    {
+        "name": "accordion",
+        "container": ".accordionItem, [class*='accordionItem']",
+        "title": "h2, h3, h4, button",
+        "body": "[class*='content'], p",
+        "date": "[class*='date'], time",
+    },
+    {
+        "name": "article",
+        "container": "article, .card, [class*='alertCard']",
+        "title": "h2, h3, h4, [class*='title']",
+        "body": "p, [class*='description']",
+        "date": "time, [class*='date']",
+    },
+]
+
+
+load_dotenv(dotenv_path=ENV_PATH, override=False)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def load_store() -> dict[str, Any]:
+    if not STORE_PATH.exists():
+        return {"alerts": [], "last_updated": None}
+
+    with STORE_PATH.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if "alerts" not in data or not isinstance(data["alerts"], list):
+        data["alerts"] = []
+    if "last_updated" not in data:
+        data["last_updated"] = None
+    return data
+
+
+def save_store(store: dict[str, Any]) -> None:
+    STORE_PATH.write_text(json.dumps(store, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def clean_text(value: str) -> str:
+    parts = [segment.strip() for segment in value.splitlines()]
+    collapsed = " ".join(part for part in parts if part)
+    return " ".join(collapsed.split())
+
+
+def first_text(locator: Any, timeout: int = 2_000) -> str:
+    try:
+        if locator.count() == 0:
+            return ""
+        return clean_text(locator.first.text_content(timeout=timeout) or "")
+    except Exception:
+        return ""
+
+
+def build_alert_id(title: str, date: str) -> str:
+    digest = hashlib.sha256(f"{title}|{date}".encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def subject_for(alerts: list[dict[str, Any]]) -> str:
+    if len(alerts) == 1:
+        title = alerts[0]["title"]
+        if len(title) > 60:
+            title = f"{title[:60]}..."
+        return f"[QA Alert] {title}"
+    return f"[QA Alerts] {len(alerts)} new travel alerts detected"
+
+
+def truncate_fallback(text: str, limit: int = 300) -> str:
+    trimmed = clean_text(text)
+    return trimmed[:limit]
+
+
+def read_env(name: str, required: bool = True) -> str | None:
+    value = os.getenv(name)
+    if value:
+        return value
+    if required:
+        raise KeyError(name)
+    return None
+
+
+def generate_summary(title: str, raw_body: str) -> str:
+    api_key = read_env("OPENROUTER_API_KEY")
+    repository = os.getenv("GITHUB_REPOSITORY", "qa-alert-scraper")
+
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+
+    prompt = (
+        "You are summarising a travel alert from Qatar Airways.\n\n"
+        f"Alert title: {title}\n\n"
+        "Alert body:\n"
+        f"{raw_body[:3000]}\n\n"
+        "Write a clear, factual summary in 2-3 sentences. Cover: what the disruption is, "
+        "which routes or destinations are affected, and any passenger action required. "
+        "Do not include disclaimers, marketing language, or your own commentary. "
+        "Output only the summary text, nothing else."
+    )
+
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b:free",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}],
+        extra_headers={
+            "HTTP-Referer": f"https://github.com/{repository}",
+            "X-Title": "QA Alert Scraper",
+        },
+    )
+
+    content = response.choices[0].message.content or ""
+    return clean_text(content)
+
+
+def email_config() -> dict[str, Any] | None:
+    names = [
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REFRESH_TOKEN",
+        "EMAIL_FROM",
+        "EMAIL_TO",
+    ]
+    values = {name: os.getenv(name) for name in names}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        log.error("Email secrets missing: %s", ", ".join(missing))
+        return None
+
+    return {
+        "client_id": values["GOOGLE_CLIENT_ID"],
+        "client_secret": values["GOOGLE_CLIENT_SECRET"],
+        "refresh_token": values["GOOGLE_REFRESH_TOKEN"],
+        "from": values["EMAIL_FROM"],
+        "to": [address.strip() for address in values["EMAIL_TO"].split(",") if address.strip()],
+    }
+
+
+def build_email_html(alerts: list[dict[str, Any]], run_timestamp: str) -> str:
+    cards = []
+    for alert in alerts:
+        alert_date = escape(alert["date"] or "Date unavailable")
+        alert_title = escape(alert["title"])
+        alert_summary = escape(alert["summary"])
+        alert_url = escape(alert["url"])
+        cards.append(
+            f"""
+            <div style="border-left:4px solid #5C0632;background:#fff8f8;padding:16px 18px;margin:0 0 16px 0;">
+              <div style="font-size:12px;color:#7a7a7a;margin-bottom:6px;">{alert_date}</div>
+              <div style="font-size:16px;font-weight:700;color:#1f1f1f;margin-bottom:8px;">{alert_title}</div>
+              <div style="font-size:14px;line-height:1.6;color:#444444;margin-bottom:10px;">{alert_summary}</div>
+              <a href="{alert_url}" style="color:#5C0632;text-decoration:none;font-weight:600;">View on Qatar Airways &rarr;</a>
+            </div>
+            """.strip()
+        )
+
+    return f"""
+    <html>
+      <body style="margin:0;padding:0;background:#ffffff;font-family:Arial,sans-serif;color:#222222;">
+        <div style="max-width:680px;margin:0 auto;padding:24px;">
+          <div style="background:#5C0632;color:#ffffff;padding:18px 20px;font-size:22px;font-weight:700;">
+            Qatar Airways Travel Alerts
+          </div>
+          <div style="padding:20px 0 8px 0;">
+            {''.join(cards)}
+          </div>
+          <div style="font-size:12px;color:#666666;padding-top:12px;border-top:1px solid #e7dcdc;">
+            Run timestamp (UTC): {escape(run_timestamp)}<br>
+            Alerts page: <a href="{ALERTS_URL}" style="color:#5C0632;">{ALERTS_URL}</a>
+          </div>
+        </div>
+      </body>
+    </html>
+    """.strip()
+
+
+def build_email_text(alerts: list[dict[str, Any]], run_timestamp: str) -> str:
+    parts = []
+    for alert in alerts:
+        parts.append(
+            "\n".join(
+                [
+                    alert["date"] or "Date unavailable",
+                    alert["title"],
+                    alert["summary"],
+                    alert["url"],
+                ]
+            )
+        )
+    parts.append(f"Run timestamp (UTC): {run_timestamp}")
+    parts.append(f"Alerts page: {ALERTS_URL}")
+    return "\n\n".join(parts)
+
+
+def send_email(alerts: list[dict[str, Any]], run_timestamp: str) -> None:
+    config = email_config()
+    if not config:
+        return
+
+    message = EmailMessage()
+    message["Subject"] = subject_for(alerts)
+    message["From"] = config["from"]
+    message["To"] = ", ".join(config["to"])
+    message.set_content(build_email_text(alerts, run_timestamp))
+    message.add_alternative(build_email_html(alerts, run_timestamp), subtype="html")
+
+    try:
+        credentials = Credentials(
+            token=None,
+            refresh_token=config["refresh_token"],
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=config["client_id"],
+            client_secret=config["client_secret"],
+            scopes=GMAIL_SCOPES,
+        )
+        credentials.refresh(Request())
+
+        service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        service.users().messages().send(
+            userId="me",
+            body={"raw": encoded_message},
+        ).execute()
+        log.info("Email sent successfully")
+    except Exception as exc:
+        log.error("Email send failed: %s", exc)
+
+
+def wait_for_any_selector(page: Any) -> None:
+    page.wait_for_selector(", ".join(WAIT_SELECTORS), timeout=20_000)
+
+
+def extract_alerts_from_strategy(page: Any, strategy: dict[str, str]) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    containers = page.locator(strategy["container"])
+    count = containers.count()
+    for index in range(count):
+        node = containers.nth(index)
+        title = first_text(node.locator(strategy["title"]))
+        if not title:
+            continue
+
+        body_parts: list[str] = []
+        body_nodes = node.locator(strategy["body"])
+        body_count = body_nodes.count()
+        for body_index in range(body_count):
+            text = clean_text(body_nodes.nth(body_index).text_content(timeout=2_000) or "")
+            if text and text not in body_parts:
+                body_parts.append(text)
+
+        date_text = first_text(node.locator(strategy["date"]))
+        raw_body = "\n".join(body_parts).strip()
+        results.append(
+            {
+                "title": title,
+                "raw_body": raw_body or title,
+                "date": date_text,
+                "url": ALERTS_URL,
+            }
+        )
+    return results
+
+
+def extract_fallback_headings(page: Any) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    headings = page.locator("main h2, main h3")
+    count = headings.count()
+    for index in range(count):
+        title = clean_text(headings.nth(index).text_content(timeout=2_000) or "")
+        if not title:
+            continue
+        results.append(
+            {
+                "title": title,
+                "raw_body": "",
+                "date": "",
+                "url": ALERTS_URL,
+            }
+        )
+    return results
+
+
+def dedupe_scraped_alerts(alerts: list[dict[str, str]]) -> list[dict[str, str]]:
+    unique: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for alert in alerts:
+        alert_id = build_alert_id(alert["title"], alert["date"])
+        if alert_id in seen_ids:
+            continue
+        seen_ids.add(alert_id)
+        unique.append(alert)
+    return unique
+
+
+def scrape_alerts() -> list[dict[str, str]]:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=USER_AGENT)
+        page = context.new_page()
+        try:
+            response = page.goto(ALERTS_URL, wait_until="networkidle", timeout=60_000)
+            if response is not None and response.status >= 400:
+                raise RuntimeError(f"Page returned HTTP {response.status}")
+            log.info("Page loaded")
+
+            try:
+                wait_for_any_selector(page)
+            except PlaywrightTimeoutError:
+                log.warning("Selector timeout")
+
+            for strategy in EXTRACTION_STRATEGIES:
+                alerts = dedupe_scraped_alerts(extract_alerts_from_strategy(page, strategy))
+                if alerts:
+                    if DEBUG_SNAPSHOT_PATH.exists():
+                        DEBUG_SNAPSHOT_PATH.unlink()
+                    if strategy["name"] != EXTRACTION_STRATEGIES[0]["name"]:
+                        log.warning("Fallback extraction strategy used")
+                    return alerts
+
+            fallback_alerts = dedupe_scraped_alerts(extract_fallback_headings(page))
+            if fallback_alerts:
+                if DEBUG_SNAPSHOT_PATH.exists():
+                    DEBUG_SNAPSHOT_PATH.unlink()
+                log.warning("Fallback extraction strategy used")
+                return fallback_alerts
+
+            DEBUG_SNAPSHOT_PATH.write_text(page.content(), encoding="utf-8")
+            log.error("No alerts extracted - debug_snapshot.html saved")
+            return []
+        finally:
+            context.close()
+            browser.close()
+
+
+def enrich_new_alerts(alerts: list[dict[str, Any]]) -> None:
+    for alert in alerts:
+        try:
+            alert["summary"] = generate_summary(alert["title"], alert["raw_body"])
+            log.info('Summary generated for alert "%s"', alert["title"])
+        except Exception as exc:
+            log.warning("Summary generation failed for '%s': %s", alert["title"], exc)
+            alert["summary"] = truncate_fallback(alert["raw_body"] or alert["title"])
+
+
+def main() -> int:
+    log.info("Scraper started")
+
+    store = load_store()
+    log.info("%s stored alerts loaded", len(store["alerts"]))
+
+    scraped = scrape_alerts()
+    if not scraped:
+        return 0
+
+    log.info("%s alerts scraped", len(scraped))
+
+    stored_ids = {alert["id"] for alert in store["alerts"]}
+    first_seen = utc_now_iso()
+    new_alerts: list[dict[str, Any]] = []
+
+    for alert in scraped:
+        alert_id = build_alert_id(alert["title"], alert["date"])
+        if alert_id in stored_ids:
+            continue
+
+        new_alerts.append(
+            {
+                "id": alert_id,
+                "title": alert["title"],
+                "raw_body": alert["raw_body"],
+                "summary": "",
+                "date": alert["date"],
+                "url": alert["url"],
+                "first_seen": first_seen,
+            }
+        )
+
+    log.info("%s new alerts found", len(new_alerts))
+
+    if not new_alerts:
+        log.info("No new alerts - nothing to do")
+        return 0
+
+    enrich_new_alerts(new_alerts)
+    send_email(new_alerts, first_seen)
+
+    store["alerts"].extend(new_alerts)
+    store["last_updated"] = first_seen
+    save_store(store)
+    log.info("alerts.json updated")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

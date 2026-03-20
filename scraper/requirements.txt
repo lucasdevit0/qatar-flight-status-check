@@ -1,0 +1,5 @@
+playwright==1.44.0
+openai==1.30.0
+google-api-python-client
+google-auth
+python-dotenv

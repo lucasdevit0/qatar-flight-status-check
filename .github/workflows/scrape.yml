@@ -1,0 +1,50 @@
+name: Qatar Travel Alerts
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scraper/requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium --with-deps
+
+      - name: Run scraper
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scraper/scraper.py
+
+      - name: Commit updated alerts store
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A scraper
+          git diff --cached --quiet || git commit -m "chore: update alert state [skip ci]"
+          git push
