@@ -2,6 +2,10 @@
 
 This repository runs a GitHub Actions workflow that checks the Qatar Airways travel alerts page twice daily, stores newly discovered alerts in `scraper/alerts.json`, generates concise AI summaries for new alerts, and emails those updates to a configured recipient.
 
+## Why This Exists
+
+My girlfriend and I are traveling to Japan at the beginning of May 2026, with a layover in Doha. Because of the recent war-related disruptions in the region, we wanted a simple way to check Qatar Airways travel alerts every day and get notified quickly if anything changed in a concerning way.
+
 ## What It Does
 
 - Scrapes `https://www.qatarairways.com/en/travel-alerts.html` with Playwright + Chromium
@@ -38,8 +42,8 @@ OPENROUTER_API_KEY=
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 GOOGLE_REFRESH_TOKEN=
-EMAIL_FROM=lucas.casadevito@gmail.com
-EMAIL_TO=lucas.casadevito@gmail.com,isabelaaxs@gmail.com
+EMAIL_FROM=your-email@example.com
+EMAIL_TO=your-email@example.com,other-recipient@example.com
 ```
 
 ## Local Run
