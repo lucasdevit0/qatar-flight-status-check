@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from html import escape
@@ -15,6 +16,7 @@ from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+import httpx
 from openai import OpenAI
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -25,10 +27,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 ALERTS_URL = "https://www.qatarairways.com/en/travel-alerts.html"
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120"
+TEXT_MIRROR_URL = "https://r.jina.ai/http://https://www.qatarairways.com/en/travel-alerts.html"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 STORE_PATH = Path(__file__).with_name("alerts.json")
 DEBUG_SNAPSHOT_PATH = Path(__file__).with_name("debug_snapshot.html")
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
@@ -98,6 +102,18 @@ def first_text(locator: Any, timeout: int = 2_000) -> str:
         return clean_text(locator.first.text_content(timeout=timeout) or "")
     except Exception:
         return ""
+
+
+def markdown_to_text(value: str) -> str:
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", value)
+    text = re.sub(r"!\[[^\]]*\]", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = text.replace("**", "")
+    text = text.replace("__", "")
+    text = text.replace("`", "")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def build_alert_id(title: str, date: str) -> str:
@@ -341,7 +357,66 @@ def dedupe_scraped_alerts(alerts: list[dict[str, str]]) -> list[dict[str, str]]:
     return unique
 
 
-def scrape_alerts() -> list[dict[str, str]]:
+def scrape_alerts_via_text_mirror() -> tuple[list[dict[str, str]], str]:
+    response = httpx.get(
+        TEXT_MIRROR_URL,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/plain, text/markdown;q=0.9, */*;q=0.8",
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    markdown = response.text
+
+    section_match = re.search(r"# Travel Alerts.*", markdown, flags=re.S)
+    relevant = section_match.group(0) if section_match else markdown
+    relevant = relevant.split("\n## Qatar Airways", 1)[0]
+
+    pattern = re.compile(
+        r"!\[Image [^\]]+\](?P<header>[^\n]+)\n+(?P<body>.*?)(?=\n!\[Image [^\]]+\][^\n]+|\n## |\Z)",
+        flags=re.S,
+    )
+
+    results: list[dict[str, str]] = []
+    for match in pattern.finditer(relevant):
+        header = clean_text(re.sub(r"^(?:\([^)]+\))+", "", match.group("header")).strip())
+        if not header or header == "Travel Alerts":
+            continue
+
+        header_match = re.match(
+            r"(?P<date>\d{1,2}:\d{2}\s+GMT[+-]\d,\s+\d{1,2}\s+\w+\s+\d{4})\s*:\s*(?P<title>.+)",
+            header,
+        )
+        if header_match:
+            date_text = header_match.group("date")
+            title = clean_text(header_match.group("title"))
+        else:
+            # Ignore non-alert decorative content from the mirrored markdown.
+            if header in {"Qatar Airways"} or len(header) < 20:
+                continue
+            date_text = ""
+            title = header
+
+        body = markdown_to_text(match.group("body"))
+        if not title:
+            continue
+
+        results.append(
+            {
+                "title": title,
+                "raw_body": body or title,
+                "date": date_text,
+                "url": ALERTS_URL,
+            }
+        )
+
+    if results:
+        log.warning("Fallback extraction strategy used: text mirror")
+    return dedupe_scraped_alerts(results), markdown
+
+
+def scrape_alerts_via_playwright() -> list[dict[str, str]]:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         context = browser.new_context(user_agent=USER_AGENT)
@@ -379,6 +454,26 @@ def scrape_alerts() -> list[dict[str, str]]:
         finally:
             context.close()
             browser.close()
+
+
+def scrape_alerts() -> list[dict[str, str]]:
+    try:
+        alerts = scrape_alerts_via_playwright()
+        if alerts:
+            return alerts
+    except Exception as exc:
+        log.warning("Primary scrape failed: %s", exc)
+
+    try:
+        alerts, markdown = scrape_alerts_via_text_mirror()
+        if alerts:
+            DEBUG_SNAPSHOT_PATH.write_text(markdown, encoding="utf-8")
+            return alerts
+    except (httpx.HTTPError, TimeoutError, OSError) as exc:
+        log.warning("Text mirror fallback failed: %s", exc)
+
+    log.error("No alerts extracted - all strategies failed")
+    return []
 
 
 def enrich_new_alerts(alerts: list[dict[str, Any]]) -> None:
