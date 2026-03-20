@@ -226,33 +226,45 @@ def generate_summary(title: str, raw_body: str) -> str:
         api_key=os.environ["OPENROUTER_API_KEY"],
     )
 
-    prompt = f"""You are summarising a travel alert from Qatar Airways.
+    prompt = f"""You are summarising a travel alert from Qatar Airways for airline passengers.
 
 Alert title: {title}
 
 Alert body:
 {raw_body[:3000]}
 
-Write a clear, factual summary in 2-3 sentences. Cover: what the disruption is, which routes or destinations are affected, and any passenger action required. Do not include disclaimers, marketing language, or your own commentary. Output only the summary text, nothing else."""
+Write 2 or 3 complete sentences in plain English. Include: 1) the disruption or operational status, 2) who or which routes, airports, or travel dates are affected, and 3) what passengers should do next such as checking flight status, rebooking, or requesting a refund. Be specific when the alert includes date ranges or deadlines. Do not copy long text from the alert. Do not output bullets, labels, quotation marks, or fragments. Output only the final summary."""
 
     response = client.chat.completions.create(
         model="openai/gpt-oss-20b",
-        max_tokens=200,
+        max_tokens=260,
         messages=[{"role": "user", "content": prompt}],
         extra_headers={
             "HTTP-Referer": "https://github.com/lucasdevit0/qatar-flight-status-check",
             "X-Title": "QA Alert Scraper",
         },
+        extra_body={
+            "reasoning": {
+                "effort": "low",
+                "exclude": True,
+            }
+        },
     )
-    return response.choices[0].message.content.strip()
+    summary = extract_summary_text(response)
+    if not is_summary_usable(summary):
+        raise ValueError("Model returned an empty or incomplete summary")
+    return summary
 ```
 
 **Fallback behavior**
 
-If the OpenRouter call raises any exception, the scraper logs a warning and falls back to:
+If the OpenRouter call raises any exception, or if it returns an empty/incomplete summary, the scraper logs a warning and falls back to a local summary builder that:
+- cleans the raw alert body
+- extracts the first 2-3 useful sentences
+- guarantees a non-empty summary is available for the email
 
 ```python
-alert["summary"] = raw_body[:300]
+alert["summary"] = build_fallback_summary(title, raw_body)
 ```
 
 This means summary failures never block storage updates or email sending.
@@ -388,6 +400,7 @@ Use Python `logging` at `INFO` level.
 | N new alerts found | INFO |
 | Summary generated for alert "{title}" | INFO |
 | Summary generation failed, using fallback | WARNING |
+| Model returned empty or incomplete summary | WARNING |
 | Primary scrape failed | WARNING |
 | Fallback extraction strategy used | WARNING |
 | Text mirror fallback failed | WARNING |

@@ -135,6 +135,67 @@ def truncate_fallback(text: str, limit: int = 300) -> str:
     return trimmed[:limit]
 
 
+def split_sentences(text: str) -> list[str]:
+    normalized = clean_text(
+        text.replace("\u202f", " ").replace("\u00a0", " ").replace("\u2011", "-")
+    )
+    if not normalized:
+        return []
+    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", normalized) if sentence.strip()]
+
+
+def build_fallback_summary(title: str, raw_body: str) -> str:
+    sentences = split_sentences(raw_body)
+    selected: list[str] = []
+
+    for sentence in sentences:
+        lowered = sentence.lower()
+        if lowered in {item.lower() for item in selected}:
+            continue
+        if len(sentence) < 25:
+            continue
+        selected.append(sentence)
+        if len(selected) == 3:
+            break
+
+    if not selected:
+        base = clean_text(raw_body or title)
+        if len(base) <= 320:
+            return base
+        return f"{base[:317]}..."
+
+    summary = " ".join(selected)
+    if len(summary) > 500:
+        summary = f"{summary[:497]}..."
+    return summary
+
+
+def extract_summary_text(response: Any) -> str:
+    message = response.choices[0].message
+    content = message.content
+
+    if isinstance(content, str):
+        return clean_text(content.replace("\u202f", " ").replace("\u00a0", " ").replace("\u2011", "-"))
+
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+            elif hasattr(item, "type") and getattr(item, "type", None) == "text":
+                text_parts.append(getattr(item, "text", ""))
+        return clean_text(" ".join(text_parts).replace("\u202f", " ").replace("\u00a0", " ").replace("\u2011", "-"))
+
+    return ""
+
+
+def is_summary_usable(summary: str) -> bool:
+    if not summary or len(summary) < 80:
+        return False
+    sentence_count = len(split_sentences(summary))
+    return sentence_count >= 2
+
+
 def read_env(name: str, required: bool = True) -> str | None:
     value = os.getenv(name)
     if value:
@@ -154,28 +215,39 @@ def generate_summary(title: str, raw_body: str) -> str:
     )
 
     prompt = (
-        "You are summarising a travel alert from Qatar Airways.\n\n"
+        "You are summarising a travel alert from Qatar Airways for airline passengers.\n\n"
         f"Alert title: {title}\n\n"
         "Alert body:\n"
         f"{raw_body[:3000]}\n\n"
-        "Write a clear, factual summary in 2-3 sentences. Cover: what the disruption is, "
-        "which routes or destinations are affected, and any passenger action required. "
-        "Do not include disclaimers, marketing language, or your own commentary. "
-        "Output only the summary text, nothing else."
+        "Write 2 or 3 complete sentences in plain English. Include: "
+        "1) the disruption or operational status, "
+        "2) who or which routes, airports, or travel dates are affected, and "
+        "3) what passengers should do next such as checking flight status, rebooking, or requesting a refund. "
+        "Be specific when the alert includes date ranges or deadlines. "
+        "Do not copy long text from the alert. Do not output bullets, labels, quotation marks, or fragments. "
+        "Output only the final summary."
     )
 
     response = client.chat.completions.create(
         model="openai/gpt-oss-20b",
-        max_tokens=200,
+        max_tokens=260,
         messages=[{"role": "user", "content": prompt}],
         extra_headers={
             "HTTP-Referer": f"https://github.com/{repository}",
             "X-Title": "QA Alert Scraper",
         },
+        extra_body={
+            "reasoning": {
+                "effort": "low",
+                "exclude": True,
+            }
+        },
     )
 
-    content = response.choices[0].message.content or ""
-    return clean_text(content)
+    summary = extract_summary_text(response)
+    if not is_summary_usable(summary):
+        raise ValueError("Model returned an empty or incomplete summary")
+    return summary
 
 
 def email_config() -> dict[str, Any] | None:
@@ -483,7 +555,7 @@ def enrich_new_alerts(alerts: list[dict[str, Any]]) -> None:
             log.info('Summary generated for alert "%s"', alert["title"])
         except Exception as exc:
             log.warning("Summary generation failed for '%s': %s", alert["title"], exc)
-            alert["summary"] = truncate_fallback(alert["raw_body"] or alert["title"])
+            alert["summary"] = build_fallback_summary(alert["title"], alert["raw_body"])
 
 
 def main() -> int:
