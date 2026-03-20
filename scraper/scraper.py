@@ -165,7 +165,7 @@ def generate_summary(title: str, raw_body: str) -> str:
     )
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b:free",
+        model="openai/gpt-oss-20b",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
         extra_headers={
