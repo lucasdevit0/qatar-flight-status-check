@@ -34,9 +34,11 @@ ALERTS_URL = "https://www.qatarairways.com/en/travel-alerts.html"
 TEXT_MIRROR_URL = "https://r.jina.ai/http://https://www.qatarairways.com/en/travel-alerts.html"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 STORE_PATH = Path(__file__).with_name("alerts.json")
+RUN_LOGS_PATH = Path(__file__).with_name("run_logs.json")
 DEBUG_SNAPSHOT_PATH = Path(__file__).with_name("debug_snapshot.html")
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+MAX_RUN_LOGS = 100
 
 WAIT_SELECTORS = [
     ".accordionItem",
@@ -85,8 +87,31 @@ def load_store() -> dict[str, Any]:
     return data
 
 
+def load_run_logs() -> dict[str, Any]:
+    if not RUN_LOGS_PATH.exists():
+        return {"runs": []}
+
+    with RUN_LOGS_PATH.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if "runs" not in data or not isinstance(data["runs"], list):
+        data["runs"] = []
+    return data
+
+
 def save_store(store: dict[str, Any]) -> None:
     STORE_PATH.write_text(json.dumps(store, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def save_run_logs(run_logs: dict[str, Any]) -> None:
+    RUN_LOGS_PATH.write_text(json.dumps(run_logs, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def append_run_log(entry: dict[str, Any]) -> None:
+    run_logs = load_run_logs()
+    run_logs["runs"].append(entry)
+    run_logs["runs"] = run_logs["runs"][-MAX_RUN_LOGS:]
+    save_run_logs(run_logs)
 
 
 def clean_text(value: str) -> str:
@@ -329,10 +354,10 @@ def build_email_text(alerts: list[dict[str, Any]], run_timestamp: str) -> str:
     return "\n\n".join(parts)
 
 
-def send_email(alerts: list[dict[str, Any]], run_timestamp: str) -> None:
+def send_email(alerts: list[dict[str, Any]], run_timestamp: str) -> bool:
     config = email_config()
     if not config:
-        return
+        return False
 
     message = EmailMessage()
     message["Subject"] = subject_for(alerts)
@@ -359,8 +384,10 @@ def send_email(alerts: list[dict[str, Any]], run_timestamp: str) -> None:
             body={"raw": encoded_message},
         ).execute()
         log.info("Email sent successfully")
+        return True
     except Exception as exc:
         log.error("Email send failed: %s", exc)
+        return False
 
 
 def wait_for_any_selector(page: Any) -> None:
@@ -528,11 +555,11 @@ def scrape_alerts_via_playwright() -> list[dict[str, str]]:
             browser.close()
 
 
-def scrape_alerts() -> list[dict[str, str]]:
+def scrape_alerts() -> tuple[list[dict[str, str]], str | None]:
     try:
         alerts = scrape_alerts_via_playwright()
         if alerts:
-            return alerts
+            return alerts, "playwright"
     except Exception as exc:
         log.warning("Primary scrape failed: %s", exc)
 
@@ -540,15 +567,16 @@ def scrape_alerts() -> list[dict[str, str]]:
         alerts, markdown = scrape_alerts_via_text_mirror()
         if alerts:
             DEBUG_SNAPSHOT_PATH.write_text(markdown, encoding="utf-8")
-            return alerts
+            return alerts, "text_mirror"
     except (httpx.HTTPError, TimeoutError, OSError) as exc:
         log.warning("Text mirror fallback failed: %s", exc)
 
     log.error("No alerts extracted - all strategies failed")
-    return []
+    return [], None
 
 
-def enrich_new_alerts(alerts: list[dict[str, Any]]) -> None:
+def enrich_new_alerts(alerts: list[dict[str, Any]]) -> int:
+    failures = 0
     for alert in alerts:
         try:
             alert["summary"] = generate_summary(alert["title"], alert["raw_body"])
@@ -556,55 +584,103 @@ def enrich_new_alerts(alerts: list[dict[str, Any]]) -> None:
         except Exception as exc:
             log.warning("Summary generation failed for '%s': %s", alert["title"], exc)
             alert["summary"] = build_fallback_summary(alert["title"], alert["raw_body"])
+            failures += 1
+    return failures
 
 
 def main() -> int:
+    run_started_at = utc_now_iso()
+    run_log: dict[str, Any] = {
+        "run_started_at": run_started_at,
+        "run_finished_at": None,
+        "stored_alerts_before": 0,
+        "alerts_scraped": 0,
+        "new_alerts_found": 0,
+        "scrape_method": None,
+        "summary_failures": 0,
+        "email_attempted": False,
+        "email_sent": False,
+        "alerts_updated": False,
+        "worked_correctly": False,
+        "status": "started",
+        "message": "",
+    }
+
     log.info("Scraper started")
 
-    store = load_store()
-    log.info("%s stored alerts loaded", len(store["alerts"]))
+    try:
+        store = load_store()
+        run_log["stored_alerts_before"] = len(store["alerts"])
+        log.info("%s stored alerts loaded", len(store["alerts"]))
 
-    scraped = scrape_alerts()
-    if not scraped:
+        scraped, scrape_method = scrape_alerts()
+        run_log["alerts_scraped"] = len(scraped)
+        run_log["scrape_method"] = scrape_method
+
+        if not scraped:
+            run_log["status"] = "no_alerts_extracted"
+            run_log["message"] = "No alerts were extracted from either scrape path."
+            return 0
+
+        log.info("%s alerts scraped", len(scraped))
+
+        stored_ids = {alert["id"] for alert in store["alerts"]}
+        first_seen = utc_now_iso()
+        new_alerts: list[dict[str, Any]] = []
+
+        for alert in scraped:
+            alert_id = build_alert_id(alert["title"], alert["date"])
+            if alert_id in stored_ids:
+                continue
+
+            new_alerts.append(
+                {
+                    "id": alert_id,
+                    "title": alert["title"],
+                    "raw_body": alert["raw_body"],
+                    "summary": "",
+                    "date": alert["date"],
+                    "url": alert["url"],
+                    "first_seen": first_seen,
+                }
+            )
+
+        run_log["new_alerts_found"] = len(new_alerts)
+        log.info("%s new alerts found", len(new_alerts))
+
+        if not new_alerts:
+            log.info("No new alerts - nothing to do")
+            run_log["worked_correctly"] = True
+            run_log["status"] = "no_new_alerts"
+            run_log["message"] = "Scrape completed successfully but there were no new alerts."
+            return 0
+
+        run_log["summary_failures"] = enrich_new_alerts(new_alerts)
+        run_log["email_attempted"] = True
+        run_log["email_sent"] = send_email(new_alerts, first_seen)
+
+        store["alerts"].extend(new_alerts)
+        store["last_updated"] = first_seen
+        save_store(store)
+        run_log["alerts_updated"] = True
+        log.info("alerts.json updated")
+
+        if run_log["summary_failures"] == 0 and run_log["email_sent"]:
+            run_log["worked_correctly"] = True
+            run_log["status"] = "success"
+            run_log["message"] = "Scrape, summary generation, email, and storage update all succeeded."
+        else:
+            run_log["worked_correctly"] = False
+            run_log["status"] = "partial_success"
+            run_log["message"] = "Run completed, but one or more summaries fell back or the email was not sent."
         return 0
-
-    log.info("%s alerts scraped", len(scraped))
-
-    stored_ids = {alert["id"] for alert in store["alerts"]}
-    first_seen = utc_now_iso()
-    new_alerts: list[dict[str, Any]] = []
-
-    for alert in scraped:
-        alert_id = build_alert_id(alert["title"], alert["date"])
-        if alert_id in stored_ids:
-            continue
-
-        new_alerts.append(
-            {
-                "id": alert_id,
-                "title": alert["title"],
-                "raw_body": alert["raw_body"],
-                "summary": "",
-                "date": alert["date"],
-                "url": alert["url"],
-                "first_seen": first_seen,
-            }
-        )
-
-    log.info("%s new alerts found", len(new_alerts))
-
-    if not new_alerts:
-        log.info("No new alerts - nothing to do")
-        return 0
-
-    enrich_new_alerts(new_alerts)
-    send_email(new_alerts, first_seen)
-
-    store["alerts"].extend(new_alerts)
-    store["last_updated"] = first_seen
-    save_store(store)
-    log.info("alerts.json updated")
-    return 0
+    except Exception as exc:
+        run_log["status"] = "error"
+        run_log["message"] = str(exc)
+        raise
+    finally:
+        run_log["run_finished_at"] = utc_now_iso()
+        append_run_log(run_log)
 
 
 if __name__ == "__main__":

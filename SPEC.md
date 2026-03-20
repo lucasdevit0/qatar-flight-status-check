@@ -17,6 +17,7 @@ A GitHub Actions workflow that:
 5. For each new alert, calls the OpenRouter API to generate a clean 2-3 sentence summary from the raw scraped body text
 6. If new alerts are found, sends an HTML email through the Gmail API
 7. Commits the updated `alerts.json` back to the repo
+8. Appends a structured result entry to `run_logs.json` after every run
 
 No server, no VPS. Fully cloud-native and runs inside GitHub Actions.
 
@@ -33,6 +34,7 @@ qatar-flight-status-check/
 |   |-- scraper.py
 |   |-- requirements.txt
 |   |-- alerts.json
+|   |-- run_logs.json
 |   `-- debug_snapshot.html   # created only on scrape fallback/failure
 |-- .env                      # local only, gitignored
 |-- .gitignore
@@ -156,6 +158,37 @@ If the file does not exist, initialize as:
   "last_updated": null
 }
 ```
+
+### 4.2.1 Run Log Format (`run_logs.json`)
+
+The scraper also stores a rolling JSON history of recent runs:
+
+```json
+{
+  "runs": [
+    {
+      "run_started_at": "2026-03-20T14:02:10Z",
+      "run_finished_at": "2026-03-20T14:02:24Z",
+      "stored_alerts_before": 0,
+      "alerts_scraped": 3,
+      "new_alerts_found": 3,
+      "scrape_method": "text_mirror",
+      "summary_failures": 0,
+      "email_attempted": true,
+      "email_sent": true,
+      "alerts_updated": true,
+      "worked_correctly": true,
+      "status": "success",
+      "message": "Scrape, summary generation, email, and storage update all succeeded."
+    }
+  ]
+}
+```
+
+The file:
+- appends one entry per run
+- records time, results found, delivery outcome, and overall status
+- keeps only the most recent 100 runs
 
 ### 4.3 Scraping Strategy
 
@@ -411,6 +444,8 @@ Use Python `logging` at `INFO` level.
 | No alerts extracted - all strategies failed | ERROR |
 | Email send failed | ERROR |
 
+In addition to console logging, each run appends a structured record to `scraper/run_logs.json`.
+
 ---
 
 ## 8. Edge Cases & Error Handling
@@ -426,6 +461,8 @@ Use Python `logging` at `INFO` level.
 | Gmail secrets missing | Log error, skip email, still update storage |
 | Gmail send fails | Log error, still update storage |
 | Zero new alerts | Skip summary generation, skip email, skip git commit |
+| Run completes with summary/email issues | Record `partial_success` in `run_logs.json` |
+| Unexpected exception | Record `error` in `run_logs.json` before exiting |
 
 ---
 
@@ -446,11 +483,13 @@ START
   |
   |-- for each new alert:
   |     |-- call OpenRouter (openai/gpt-oss-20b)
-  |     `-- on failure -> use raw_body[:300]
+  |     `-- on failure -> use local fallback summary
   |
   |-- send Gmail API email
   |
   |-- append new_alerts to alerts.json -> save
+  |
+  |-- append run result to run_logs.json
   |
   `-- git add + commit [skip ci] + push
 ```
