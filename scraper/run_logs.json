@@ -599,6 +599,21 @@
       "worked_correctly": true,
       "status": "no_new_alerts",
       "message": "Scrape completed successfully but there were no new alerts."
+    },
+    {
+      "run_started_at": "2026-04-09T12:59:22Z",
+      "run_finished_at": "2026-04-09T12:59:28Z",
+      "stored_alerts_before": 5,
+      "alerts_scraped": 3,
+      "new_alerts_found": 1,
+      "scrape_method": "text_mirror",
+      "summary_failures": 0,
+      "email_attempted": true,
+      "email_sent": true,
+      "alerts_updated": true,
+      "worked_correctly": true,
+      "status": "success",
+      "message": "Scrape, summary generation, email, and storage update all succeeded."
     }
   ]
 }
