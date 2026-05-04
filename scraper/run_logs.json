@@ -1334,6 +1334,21 @@
       "worked_correctly": true,
       "status": "no_new_alerts",
       "message": "Scrape completed successfully but there were no new alerts."
+    },
+    {
+      "run_started_at": "2026-05-04T01:47:35Z",
+      "run_finished_at": "2026-05-04T01:47:41Z",
+      "stored_alerts_before": 9,
+      "alerts_scraped": 4,
+      "new_alerts_found": 0,
+      "scrape_method": "text_mirror",
+      "summary_failures": 0,
+      "email_attempted": false,
+      "email_sent": false,
+      "alerts_updated": false,
+      "worked_correctly": true,
+      "status": "no_new_alerts",
+      "message": "Scrape completed successfully but there were no new alerts."
     }
   ]
 }
