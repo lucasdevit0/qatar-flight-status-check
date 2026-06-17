@@ -1,21 +1,6 @@
 {
   "runs": [
     {
-      "run_started_at": "2026-04-28T13:25:33Z",
-      "run_finished_at": "2026-04-28T13:25:40Z",
-      "stored_alerts_before": 8,
-      "alerts_scraped": 4,
-      "new_alerts_found": 1,
-      "scrape_method": "text_mirror",
-      "summary_failures": 0,
-      "email_attempted": true,
-      "email_sent": true,
-      "alerts_updated": true,
-      "worked_correctly": true,
-      "status": "success",
-      "message": "Scrape, summary generation, email, and storage update all succeeded."
-    },
-    {
       "run_started_at": "2026-04-29T01:53:02Z",
       "run_finished_at": "2026-04-29T01:53:08Z",
       "stored_alerts_before": 9,
@@ -1488,6 +1473,21 @@
     {
       "run_started_at": "2026-06-17T02:37:03Z",
       "run_finished_at": "2026-06-17T02:37:08Z",
+      "stored_alerts_before": 9,
+      "alerts_scraped": 0,
+      "new_alerts_found": 0,
+      "scrape_method": null,
+      "summary_failures": 0,
+      "email_attempted": false,
+      "email_sent": false,
+      "alerts_updated": false,
+      "worked_correctly": false,
+      "status": "no_alerts_extracted",
+      "message": "No alerts were extracted from either scrape path."
+    },
+    {
+      "run_started_at": "2026-06-17T14:47:32Z",
+      "run_finished_at": "2026-06-17T14:47:37Z",
       "stored_alerts_before": 9,
       "alerts_scraped": 0,
       "new_alerts_found": 0,
